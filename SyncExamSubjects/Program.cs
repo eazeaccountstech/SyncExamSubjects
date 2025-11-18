@@ -19,7 +19,8 @@ builder.Services.AddLogging(cfg => cfg.AddConsole());
 var host = builder.Build();
 
 var logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Startup");
-logger.LogInformation("SyncExamSubjects job starting");
+var settings = host.Services.GetRequiredService<SyncSettings>();
+logger.LogInformation("SyncExamSubjects job starting; DryRun={DryRun}, BatchSize={BatchSize}, Timeout={Timeout}", settings.DryRun, settings.BatchSize, settings.CommandTimeoutSeconds);
 
 var svc = host.Services.GetRequiredService<ISyncService>();
 await svc.RunAsync(CancellationToken.None);

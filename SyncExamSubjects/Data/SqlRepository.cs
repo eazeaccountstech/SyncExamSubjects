@@ -12,7 +12,7 @@ public interface ISqlRepository
     Task<(DateTime? lastRunAt, long? lastProcessedId)> GetLastRunAsync(string tableName, CancellationToken ct);
     Task<int> StartRunLogAsync(string tableName, CancellationToken ct);
     Task UpdateRunLogCompleteAsync(int runLogId, string tableName, DateTime lastRunAt, long? lastProcessedId, int inserted, int updated, int scanned, string status, string? error, CancellationToken ct);
-    Task<int> MergeBatchAsync(string tableName, string primaryKey, IEnumerable<IDictionary<string, object?>> rows, CancellationToken ct);
+    Task<(int inserted, int updated, int scanned, DateTime? newLastRunAt, long? newLastProcessedId)> ExecuteGenericSyncAsync(TableSyncConfig table, DateTime? lastRunAt, long? lastProcessedId, bool dryRun, CancellationToken ct);
 }
 
 public sealed class SqlRepository : ISqlRepository
@@ -32,7 +32,7 @@ public sealed class SqlRepository : ISqlRepository
 
     public async Task<(DateTime? lastRunAt, long? lastProcessedId)> GetLastRunAsync(string tableName, CancellationToken ct)
     {
-        const string sql = "SELECT TOP 1 last_run_at, last_processed_id FROM S4Job_Run_Log WHERE table_name=@table ORDER BY last_run_at DESC";
+        const string sql = "SELECT TOP 1 last_run_at, last_processed_id FROM S4Job_Run_Log WHERE table_name=@table AND status='Success' ORDER BY last_run_at DESC, last_processed_id DESC";
         await using var conn = CreateConnection();
         var result = await conn.QueryFirstOrDefaultAsync(sql, new { table = tableName });
         if (result == null) return (null, null);
@@ -43,10 +43,10 @@ public sealed class SqlRepository : ISqlRepository
 
     public async Task<int> StartRunLogAsync(string tableName, CancellationToken ct)
     {
-        const string sql = @"INSERT INTO S4Job_Run_Log(table_name, started_at, status) VALUES(@t, SYSUTCDATETIME(), 'Running'); SELECT SCOPE_IDENTITY();";
+        const string sql = @"INSERT INTO S4Job_Run_Log(table_name, started_at, status) VALUES(@t, SYSUTCDATETIME(), 'Running'); SELECT CAST(SCOPE_IDENTITY() AS int);";
         await using var conn = CreateConnection();
-        var id = await conn.ExecuteScalarAsync<decimal>(sql, new { t = tableName });
-        return (int)id;
+        var id = await conn.ExecuteScalarAsync<int>(sql, new { t = tableName });
+        return id;
     }
 
     public async Task UpdateRunLogCompleteAsync(int runLogId, string tableName, DateTime lastRunAt, long? lastProcessedId, int inserted, int updated, int scanned, string status, string? error, CancellationToken ct)
@@ -56,37 +56,32 @@ public sealed class SqlRepository : ISqlRepository
         await conn.ExecuteAsync(sql, new { id = runLogId, lrun = lastRunAt, lpid = lastProcessedId, ins = inserted, upd = updated, scn = scanned, st = status, err = error });
     }
 
-    public async Task<int> MergeBatchAsync(string tableName, string primaryKey, IEnumerable<IDictionary<string, object?>> rows, CancellationToken ct)
+    public async Task<(int inserted, int updated, int scanned, DateTime? newLastRunAt, long? newLastProcessedId)> ExecuteGenericSyncAsync(TableSyncConfig table, DateTime? lastRunAt, long? lastProcessedId, bool dryRun, CancellationToken ct)
     {
-        // Simple generic MERGE via temp table
-        var rowList = rows.ToList();
-        if (rowList.Count == 0) return 0;
         await using var conn = CreateConnection();
-        await conn.OpenAsync(ct);
-        using var tx = await conn.BeginTransactionAsync(ct);
+        var p = new DynamicParameters();
+        p.Add("@TableName", table.Name);
+        p.Add("@PrimaryKey", table.PrimaryKey);
+        p.Add("@CreateDateColumn", table.CreateDateColumn);
+        p.Add("@ModifyDateColumn", table.ModifyDateColumn);
+        p.Add("@LinkedServerName", _settings.LinkedServerName);
+        p.Add("@LastRunAt", lastRunAt);
+        p.Add("@LastProcessedId", lastProcessedId);
+        p.Add("@BatchSize", _settings.BatchSize);
+        p.Add("@DryRun", dryRun);
+        p.Add("@RecordsScanned", dbType: DbType.Int32, direction: ParameterDirection.Output);
+        p.Add("@RecordsInserted", dbType: DbType.Int32, direction: ParameterDirection.Output);
+        p.Add("@RecordsUpdated", dbType: DbType.Int32, direction: ParameterDirection.Output);
+        p.Add("@NewLastRunAt", dbType: DbType.DateTime2, direction: ParameterDirection.Output);
+        p.Add("@NewLastProcessedId", dbType: DbType.Int64, direction: ParameterDirection.Output);
 
-        var tempTableName = "#Staging" + Guid.NewGuid().ToString("N");
-        // Build columns from first row
-        var columns = rowList.First().Keys.ToList();
-        var createCols = string.Join(",", columns.Select(c => $"[{c}] NVARCHAR(MAX) NULL")); // Simplified types; adjust if needed
-        var createSql = $"CREATE TABLE {tempTableName} ({createCols});";
-        await conn.ExecuteAsync(createSql, transaction: tx);
+        await conn.ExecuteAsync("dbo.usp_S4_Sync_Generic", p, commandType: CommandType.StoredProcedure, commandTimeout: _settings.CommandTimeoutSeconds);
 
-        // Bulk insert using individual inserts (for simplicity). For performance, replace with SqlBulkCopy.
-        foreach (var r in rowList)
-        {
-            var colNames = string.Join(",", columns.Select(c => $"[{c}]"));
-            var paramNames = string.Join(",", columns.Select(c => "@" + c));
-            var insertSql = $"INSERT INTO {tempTableName} ({colNames}) VALUES ({paramNames});";
-            await conn.ExecuteAsync(insertSql, r, tx);
-        }
-
-        var setCols = string.Join(",", columns.Where(c => c != primaryKey).Select(c => $"T.[{c}] = S.[{c}]"));
-        var compareCols = string.Join(" OR ", columns.Where(c => c != primaryKey).Select(c => $"ISNULL(T.[{c}],'') <> ISNULL(S.[{c}],'')"));
-        var mergeSql = $@"MERGE [{tableName}] AS T USING {tempTableName} AS S ON T.[{primaryKey}] = S.[{primaryKey}] WHEN MATCHED AND ({compareCols}) THEN UPDATE SET {setCols} WHEN NOT MATCHED BY TARGET THEN INSERT ({string.Join(",", columns.Select(c => $"[{c}]"))}) VALUES ({string.Join(",", columns.Select(c => $"S.[{c}]"))});";
-        var affected = await conn.ExecuteAsync(mergeSql, transaction: tx, commandTimeout: _settings.CommandTimeoutSeconds);
-
-        await tx.CommitAsync(ct);
-        return affected;
+        var scanned = p.Get<int>("@RecordsScanned");
+        var inserted = p.Get<int>("@RecordsInserted");
+        var updated = p.Get<int>("@RecordsUpdated");
+        var newLastRunAt = p.Get<DateTime?>("@NewLastRunAt");
+        var newLastProcessedId = p.Get<long?>("@NewLastProcessedId");
+        return (inserted, updated, scanned, newLastRunAt, newLastProcessedId);
     }
 }
